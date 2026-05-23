@@ -4044,6 +4044,7 @@ function onLoginSuccess() {
   renderTable(loadLocal());          // hiện dữ liệu cũ ngay lập tức
   loadAndRenderTable();              // cập nhật từ Sheets API
   loadSubjectsFromGAS();            // tải danh sách môn thi
+  startSubjectsPolling();           // tự cập nhật mỗi 5 phút
 }
 
 function showAuthError(msg) {
@@ -4478,30 +4479,59 @@ function applySubjectsList(list, fileName) {
   acClose();
 }
 
-// ── Tải danh sách môn thi từ GAS khi load trang ───────────────────────────────
+// ── Tải danh sách môn thi từ Sheet SUBJECTS khi đăng nhập ────────────────────
 async function loadSubjectsFromGAS(attempt) {
   attempt = attempt || 0;
   try {
     const raw  = await sheetsGet(SHEET_NAME_SUB + '!A:A');
     const rows = raw.values || [];
-    if (rows.length < 2) return;
-    const fileName = String(rows[0][0] || 'server').split('|')[0].trim();
+    if (rows.length < 2) {
+      console.log('[Subjects] Sheet SUBJECTS trống — dùng danh sách mặc định');
+      return;
+    }
+    // Dòng 1: metadata "fileName | updatedBy | timestamp"
+    const fileName = String(rows[0][0] || '').split('|')[0].trim() || 'server';
+    // Dòng 2+: danh sách môn thi
     const subjects = rows.slice(1).map(r => String(r[0]||'')).filter(Boolean);
     if (subjects.length > 0) {
       applySubjectsList(subjects, fileName);
-      console.log(`[Subjects] Đã tải ${subjects.length} môn từ Sheets API`);
+      console.log(`[Subjects] ✅ Đã tải ${subjects.length} môn từ Sheet`);
     }
   } catch(e) {
-    // Token chưa sẵn sàng → thử lại tối đa 3 lần
-    if (attempt < 3 && (e.message.includes('Token') || e.message.includes('token') || e.message.includes('client'))) {
-      setTimeout(() => loadSubjectsFromGAS(attempt + 1), 2000);
+    console.warn(`[Subjects] Lần ${attempt + 1} thất bại:`, e.message);
+    // Retry tối đa 5 lần với delay tăng dần
+    if (attempt < 5) {
+      const delay = (attempt + 1) * 2000; // 2s, 4s, 6s, 8s, 10s
+      console.log(`[Subjects] Thử lại sau ${delay/1000}s...`);
+      setTimeout(() => loadSubjectsFromGAS(attempt + 1), delay);
     } else {
-      console.log('[Subjects] Dùng danh sách mặc định:', e.message);
+      console.log('[Subjects] Hết lần thử — dùng danh sách mặc định');
     }
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ── Polling: tự động kiểm tra cập nhật môn thi mỗi 5 phút ───────────────────
+let _subjectsPollingTimer = null;
+function startSubjectsPolling() {
+  if (_subjectsPollingTimer) clearInterval(_subjectsPollingTimer);
+  _subjectsPollingTimer = setInterval(async () => {
+    if (!currentUser || !_oauthToken) return;
+    try {
+      // Chỉ đọc dòng metadata (dòng 1) để kiểm tra có thay đổi không
+      const raw      = await sheetsGet(SHEET_NAME_SUB + '!A1');
+      const meta     = raw.values?.[0]?.[0] || '';
+      const serverFile = meta.split('|')[0].trim();
+      // So sánh với banner hiện tại
+      const bannerTitle = document.getElementById('import-banner-title');
+      const currentText = bannerTitle ? bannerTitle.textContent : '';
+      if (serverFile && !currentText.includes(serverFile)) {
+        console.log('[Subjects] Phát hiện cập nhật — đang tải lại...');
+        await loadSubjectsFromGAS();
+        toast('🔄 Danh sách môn thi vừa được cập nhật bởi quản trị viên!', 'info', 4000);
+      }
+    } catch(e) { /* bỏ qua lỗi polling */ }
+  }, 5 * 60 * 1000); // 5 phút/lần
+}
 // ĐÁP ÁN FILE IMPORT
 // ═══════════════════════════════════════════════════════════════
 // ─── Tạo tên folder từ tên môn thi (giống Google Form) ──────────────────────
@@ -4704,10 +4734,19 @@ async function gasPost(payload) {
     const fileName = payload.fileName || 'import.xlsx';
     const by       = payload.updatedBy || '';
     const ts       = new Date().toLocaleString('vi-VN');
-    // Ghi vào sheet SUBJECTS: dòng 1 = metadata, dòng 2+ = môn thi
+    if (subjects.length === 0) return { status: 'error', message: 'Danh sách trống' };
+
+    // Bước 1: Xóa toàn bộ sheet SUBJECTS
     await sheetsClear(SHEET_NAME_SUB + '!A:A');
-    const rows = [[fileName + ' | ' + by + ' | ' + ts], ...subjects.map(s => [s])];
-    await sheetsAppend(SHEET_NAME_SUB + '!A1', rows);
+
+    // Bước 2: Ghi metadata vào dòng 1 bằng UPDATE (không dùng append)
+    const meta = `${fileName} | ${by} | ${ts}`;
+    await sheetsUpdate(SHEET_NAME_SUB + '!A1', [[meta]]);
+
+    // Bước 3: Ghi danh sách môn từ dòng 2 trở đi bằng UPDATE
+    const subjectRows = subjects.map(s => [s]);
+    await sheetsUpdate(SHEET_NAME_SUB + `!A2:A${subjects.length + 1}`, subjectRows);
+
     return { status: 'ok', count: subjects.length };
   }
 
