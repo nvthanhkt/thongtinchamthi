@@ -3811,18 +3811,22 @@ let _tokenResolve = null;
 // Lấy token — lần đầu hiện consent, sau đó silent
 function getOAuthToken() {
   return new Promise((resolve, reject) => {
-    // Token còn hạn → dùng lại
+    // Token còn hạn → dùng lại ngay
     if (_oauthToken && Date.now() < _oauthTokenExp - 60000) {
       return resolve(_oauthToken);
     }
     if (!_tokenClient) {
-      return reject(new Error('Token client chưa khởi tạo — vui lòng chờ'));
+      return reject(new Error('Token client chưa sẵn sàng — thử lại sau vài giây'));
     }
-    _tokenResolve = resolve;
-    // Lần đầu (chưa có token) → buộc hiện consent để cấp quyền Sheets
-    // Lần sau → silent nếu còn session
-    const promptMode = _oauthToken ? '' : 'consent';
-    _tokenClient.requestAccessToken({ prompt: promptMode });
+    // Timeout 90s — tránh treo vô hạn nếu popup bị chặn
+    const tid = setTimeout(() => {
+      _tokenResolve = null;
+      reject(new Error('Chưa cấp quyền truy cập Google Sheet (timeout)'));
+    }, 90000);
+    _tokenResolve = (tok) => { clearTimeout(tid); resolve(tok); };
+    // Lần đầu → consent popup để cấp quyền Sheets/Drive
+    // Lần sau → '' (silent, không hiện popup nếu đã cấp)
+    _tokenClient.requestAccessToken({ prompt: _oauthToken ? '' : 'consent' });
   });
 }
 
@@ -4709,6 +4713,22 @@ async function submitForm() {
   if (!requireAuth()) return;
   if (!validateStep3()) return;
 
+  // Kiểm tra token OAuth trước — nếu chưa có thì yêu cầu cấp quyền trước
+  if (!_oauthToken || Date.now() >= _oauthTokenExp - 60000) {
+    if (!_tokenClient) {
+      toast('⚠ Hệ thống chưa sẵn sàng, thử lại sau vài giây.', 'error');
+      return;
+    }
+    toast('🔑 Cần cấp quyền truy cập Google Sheet — vui lòng đồng ý trong popup...', 'info', 10000);
+    try {
+      await getOAuthToken();
+    } catch(err) {
+      toast('⚠ Chưa cấp quyền Google Sheet: ' + err.message, 'error', 6000);
+      showGrantAccessBar();
+      return;
+    }
+  }
+
   const submitBtn = document.querySelector('#step3 .btn-primary');
   if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '⏳ Đang gửi...'; }
 
@@ -4760,14 +4780,17 @@ async function submitForm() {
 
   try {
     await gasPost({ action: 'append', data: row });
-    toast('✓ Đã lưu và gửi lên Google Sheet!', 'success');
+    toast('✅ Đã lưu thành công lên Google Sheet!', 'success');
+    resetForm();
   } catch(err) {
-    toast('⚠ Đã lưu cục bộ. Gửi lên Sheet thất bại: ' + err.message, 'error');
+    toast('⚠ Đã lưu cục bộ. Gửi Sheet thất bại: ' + err.message, 'error', 6000);
+    // Không reset form — để người dùng thử lại
   } finally {
-    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = '✓ Lưu thông tin'; }
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = '✓ Lưu thông tin';
+    }
   }
-
-  resetForm();
 }
 
 
