@@ -737,7 +737,7 @@
   <div class="header-inner">
     <div class="header-badge">Học kỳ I · Năm học 2025–2026</div>
     <h1>Thu Thập Thông Tin Chấm Thi<br>Kết Thúc Học Phần</h1>
-    <p>Trường Đại học Y Dược Huế · Phòng Đào tạo Đại học</p>
+    <p>Trường Đại học Y Dược Huế · Phòng Khảo thí - Bảo đảm chất lượng giáo dục</p>
   </div>
 </header>
 
@@ -766,7 +766,7 @@
         <div class="import-banner" id="import-banner">
           <div class="ib-icon">📋</div>
           <div class="ib-text">
-            <strong id="import-banner-title">Dữ liệu môn thi: File tích hợp sẵn (602 môn)</strong>
+            <strong id="import-banner-title">Dữ liệu môn thi</strong>
             <span id="import-banner-sub">Đang dùng danh sách môn từ lịch thi đã nhúng. Nhập file Excel khác để cập nhật.</span>
           </div>
           <button class="btn-sm" onclick="document.getElementById('import-file-input').click()">📂 Nhập file Excel</button>
@@ -816,13 +816,13 @@
         <div class="section-title">Cán bộ coi thi & Bộ môn</div>
         <div class="row2">
           <div class="field">
-            <label>CBCT 1 <span class="req">*</span></label>
-            <input type="text" id="cbct1" placeholder="Họ và tên cán bộ coi thi 1">
+            <label>Cán bộ chấm thi 1<span class="req">*</span></label>
+            <input type="text" id="cbct1" placeholder="Họ và tên cán bộ chấm thi 1">
             <div class="err-msg" id="err_cbct1">Vui lòng nhập CBCT 1.</div>
           </div>
           <div class="field">
-            <label>CBCT 2</label>
-            <input type="text" id="cbct2" placeholder="Họ và tên cán bộ coi thi 2">
+            <label>Cán bộ chấm thi 2</label>
+            <input type="text" id="cbct2" placeholder="Họ và tên cán bộ chấm thi 2">
           </div>
         </div>
         <div class="field">
@@ -3902,16 +3902,17 @@ async function sheetsClear(range) {
   return resp.json();
 }
 
-// ─── Đảm bảo sheet DATA có header ────────────────────────────────────────────
+// ─── Đảm bảo sheet DATA có header ─────────────────────────────────────────────
 async function ensureSheetHeader() {
   try {
     const data = await sheetsGet(SHEET_NAME_DATA + '!A1:I1');
+    // Chỉ ghi header nếu dòng 1 chưa có hoặc sai
     if (!data.values || !data.values[0] || data.values[0][0] !== 'Timestamp') {
       await sheetsUpdate(SHEET_NAME_DATA + '!A1:I1', [HEADERS]);
     }
+    // Nếu đã có header đúng → không làm gì cả
   } catch(e) {
-    // Sheet DATA chưa có — thử tạo header
-    try { await sheetsAppend(SHEET_NAME_DATA + '!A1', [HEADERS]); } catch(_) {}
+    console.warn('[ensureHeader] Lỗi:', e.message);
   }
 }
 
@@ -4645,8 +4646,10 @@ async function gasPost(payload) {
   // ── append ────────────────────────────────────────────────────────────────
   if (action === 'append') {
     const d = payload.data;
+    // Đảm bảo header tồn tại (chỉ ghi 1 lần nếu sheet mới)
     await ensureSheetHeader();
-    await sheetsAppend(SHEET_NAME_DATA + '!A:I', [[
+    // Append vào cuối sheet — Sheets API tự tìm dòng trống kế tiếp
+    await sheetsAppend(SHEET_NAME_DATA + '!A1:I1', [[
       d.timestamp||'', d.mon_thi||'', d.cbct1||'', d.cbct2||'',
       d.bcn||'', d.dap_an||'', d.thang_diem||'', d.can_bo_lh||'', d.ghi_chu||'',
     ]]);
@@ -4686,9 +4689,12 @@ async function gasPost(payload) {
 
   // ── clearAll ──────────────────────────────────────────────────────────────
   if (action === 'clearAll') {
-    const data = await sheetsGet(SHEET_NAME_DATA + '!A:I');
-    const rows = (data.values || []).length;
-    if (rows > 1) await sheetsClear(SHEET_NAME_DATA + '!A2:I' + rows);
+    const data = await sheetsGet(SHEET_NAME_DATA + '!A:A');
+    const totalRows = (data.values || []).length;
+    // Chỉ xóa từ dòng 2 trở đi — KHÔNG xóa dòng header (dòng 1)
+    if (totalRows > 1) {
+      await sheetsClear(SHEET_NAME_DATA + '!A2:Z' + totalRows);
+    }
     return { status: 'ok' };
   }
 
