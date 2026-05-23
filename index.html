@@ -3780,7 +3780,9 @@ const GAS_URL = 'https://script.google.com/macros/s/AKfycbxwgq5pCst3dSL8j9itLBRT
 const SHEET_ID       = '1Gu-_Xew2t6RGYHGa9TyZ4C7Qt__epXhl6e9tURzRqLw';
 const SHEET_NAME_DATA = 'DATA';
 const SHEET_NAME_SUB  = 'SUBJECTS';
-const DRIVE_FOLDER_ID = '1PwTroZXBGPZAAGjYszS-XG3PKZBbtTOv';
+const DRIVE_FOLDER_ID      = '1PwTroZXBGPZAAGjYszS-XG3PKZBbtTOv';
+const SUBJECTS_FILE_NAME   = 'subjects_monthi.json';  // file lưu danh sách môn thi trên Drive
+let   SUBJECTS_FILE_ID     = null;  // sẽ tìm/tạo khi admin upload
 const SHEETS_SCOPE    = [
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/drive.file',
@@ -4437,23 +4439,21 @@ async function importSubjectsFile(input) {
 
       // ── Áp dụng ngay cho tab hiện tại ──────────────────────────────────────
       applySubjectsList(list, file.name);
-      toast(`✓ Đã tải ${list.length} môn — đang lưu lên server...`, 'info', 4000);
+      toast(`✓ Đã tải ${list.length} môn — đang lưu lên Drive...`, 'info', 4000);
 
-      // ── Lưu lên GAS để tất cả người dùng cùng nhận ─────────────────────────
+      // ── Lưu JSON lên Drive để tất cả người dùng fetch về ────────────────────
       try {
-        const resp = await gasPost({
-          action:   'setSubjects',
-          subjects: list,
-          fileName: file.name,
-          updatedBy: currentUser ? currentUser.email : 'unknown',
-        });
-        if (resp && resp.status === 'ok') {
-          toast(`✅ Đã cập nhật ${list.length} môn thi cho tất cả người dùng!`, 'success', 5000);
+        const jsonStr  = JSON.stringify({ fileName: file.name, subjects: list,
+                           updatedBy: currentUser?.email || '', updatedAt: new Date().toISOString() });
+        const fileId   = await saveSubjectsToDrive(jsonStr);
+        if (fileId) {
+          SUBJECTS_FILE_ID = fileId;
+          toast(`✅ Đã lưu ${list.length} môn thi lên Drive — tất cả người dùng sẽ nhận được!`, 'success', 5000);
         } else {
-          toast('⚠ Lưu server thất bại — danh sách chỉ có hiệu lực ở tab này.', 'error', 5000);
+          toast('⚠ Lưu Drive thất bại — danh sách chỉ có hiệu lực ở tab này.', 'error', 5000);
         }
       } catch(err) {
-        toast('⚠ Lỗi kết nối server: ' + err.message, 'error', 5000);
+        toast('⚠ Lỗi lưu Drive: ' + err.message, 'error', 5000);
       }
 
     } catch (err) {
@@ -4468,10 +4468,9 @@ async function importSubjectsFile(input) {
 function applySubjectsList(list, fileName) {
   subjectsList   = list;
   subjectsSource = 'imported';
-  const count    = list.length;
   const bannerTitle = document.getElementById('import-banner-title');
   const bannerSub   = document.getElementById('import-banner-sub');
-  if (bannerTitle) bannerTitle.textContent = `Dữ liệu môn thi: ${fileName} (${count} môn)`;
+  if (bannerTitle) bannerTitle.textContent = `Dữ liệu môn thi: ${fileName} (${list.length} môn)`;
   if (bannerSub)   bannerSub.textContent   = `Cập nhật bởi quản trị viên · Có hiệu lực với tất cả người dùng`;
   document.getElementById('mon_thi_name').value = '';
   document.getElementById('mon-source-badge').innerHTML = '';
@@ -4479,59 +4478,116 @@ function applySubjectsList(list, fileName) {
   acClose();
 }
 
-// ── Tải danh sách môn thi từ Sheet SUBJECTS khi đăng nhập ────────────────────
+// ── Lưu JSON môn thi lên Drive (chỉ admin) ───────────────────────────────────
+async function saveSubjectsToDrive(jsonStr) {
+  const tok = await getOAuthToken();
+
+  // Tìm và xóa file cũ nếu có
+  try {
+    const q   = `name='${SUBJECTS_FILE_NAME}' and '${DRIVE_FOLDER_ID}' in parents and trashed=false`;
+    const lst = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id)`,
+      { headers: { Authorization: 'Bearer ' + tok } }
+    ).then(r => r.json());
+    for (const f of (lst.files || [])) {
+      await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`,
+        { method: 'DELETE', headers: { Authorization: 'Bearer ' + tok } });
+      console.log('[Subjects] Đã xóa file cũ:', f.id);
+    }
+  } catch(e) { console.warn('[Subjects] Xóa file cũ lỗi:', e.message); }
+
+  // Upload file JSON mới
+  const meta = JSON.stringify({ name: SUBJECTS_FILE_NAME, parents: [DRIVE_FOLDER_ID] });
+  const form = new FormData();
+  form.append('metadata', new Blob([meta], { type: 'application/json' }));
+  form.append('file',     new Blob([jsonStr], { type: 'application/json' }));
+
+  const resp = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink',
+    { method: 'POST', headers: { Authorization: 'Bearer ' + tok }, body: form }
+  );
+  if (!resp.ok) {
+    const e = await resp.json().catch(() => ({}));
+    throw new Error('Drive upload lỗi ' + resp.status + ': ' + (e.error?.message || ''));
+  }
+  const file = await resp.json();
+
+  // Đặt quyền public read — ai cũng fetch được mà không cần token
+  await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/permissions`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'reader', type: 'anyone' }),
+  });
+
+  console.log('[Subjects] ✅ Đã lưu lên Drive:', file.id);
+  return file.id;
+}
+
+// ── Tải danh sách môn thi từ Drive (mọi người dùng, dùng token để tìm file) ──
 async function loadSubjectsFromGAS(attempt) {
   attempt = attempt || 0;
   try {
-    const raw  = await sheetsGet(SHEET_NAME_SUB + '!A:A');
-    const rows = raw.values || [];
-    if (rows.length < 2) {
-      console.log('[Subjects] Sheet SUBJECTS trống — dùng danh sách mặc định');
+    const tok = await getOAuthToken();
+    // Tìm file subjects.json trong folder
+    const q   = `name='${SUBJECTS_FILE_NAME}' and '${DRIVE_FOLDER_ID}' in parents and trashed=false`;
+    const lst = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc`,
+      { headers: { Authorization: 'Bearer ' + tok } }
+    ).then(r => r.json());
+
+    const files = lst.files || [];
+    if (files.length === 0) {
+      console.log('[Subjects] Chưa có file môn thi trên Drive — dùng danh sách mặc định');
       return;
     }
-    // Dòng 1: metadata "fileName | updatedBy | timestamp"
-    const fileName = String(rows[0][0] || '').split('|')[0].trim() || 'server';
-    // Dòng 2+: danh sách môn thi
-    const subjects = rows.slice(1).map(r => String(r[0]||'')).filter(Boolean);
-    if (subjects.length > 0) {
-      applySubjectsList(subjects, fileName);
-      console.log(`[Subjects] ✅ Đã tải ${subjects.length} môn từ Sheet`);
+
+    const fileId = files[0].id;
+    // Tải nội dung JSON
+    const content = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      { headers: { Authorization: 'Bearer ' + tok } }
+    ).then(r => r.json());
+
+    if (content && Array.isArray(content.subjects) && content.subjects.length > 0) {
+      SUBJECTS_FILE_ID = fileId;
+      applySubjectsList(content.subjects, content.fileName || SUBJECTS_FILE_NAME);
+      console.log(`[Subjects] ✅ Đã tải ${content.subjects.length} môn từ Drive`);
     }
   } catch(e) {
     console.warn(`[Subjects] Lần ${attempt + 1} thất bại:`, e.message);
-    // Retry tối đa 5 lần với delay tăng dần
     if (attempt < 5) {
-      const delay = (attempt + 1) * 2000; // 2s, 4s, 6s, 8s, 10s
-      console.log(`[Subjects] Thử lại sau ${delay/1000}s...`);
-      setTimeout(() => loadSubjectsFromGAS(attempt + 1), delay);
+      setTimeout(() => loadSubjectsFromGAS(attempt + 1), (attempt + 1) * 2000);
     } else {
       console.log('[Subjects] Hết lần thử — dùng danh sách mặc định');
     }
   }
 }
 
-// ── Polling: tự động kiểm tra cập nhật môn thi mỗi 5 phút ───────────────────
+// ── Polling 5 phút: kiểm tra Drive có file mới không ─────────────────────────
 let _subjectsPollingTimer = null;
 function startSubjectsPolling() {
   if (_subjectsPollingTimer) clearInterval(_subjectsPollingTimer);
   _subjectsPollingTimer = setInterval(async () => {
     if (!currentUser || !_oauthToken) return;
     try {
-      // Chỉ đọc dòng metadata (dòng 1) để kiểm tra có thay đổi không
-      const raw      = await sheetsGet(SHEET_NAME_SUB + '!A1');
-      const meta     = raw.values?.[0]?.[0] || '';
-      const serverFile = meta.split('|')[0].trim();
-      // So sánh với banner hiện tại
-      const bannerTitle = document.getElementById('import-banner-title');
-      const currentText = bannerTitle ? bannerTitle.textContent : '';
-      if (serverFile && !currentText.includes(serverFile)) {
-        console.log('[Subjects] Phát hiện cập nhật — đang tải lại...');
+      const tok = _oauthToken;
+      const q   = `name='${SUBJECTS_FILE_NAME}' and '${DRIVE_FOLDER_ID}' in parents and trashed=false`;
+      const lst = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,modifiedTime)`,
+        { headers: { Authorization: 'Bearer ' + tok } }
+      ).then(r => r.json());
+      const files = lst.files || [];
+      // Nếu file ID thay đổi → có bản mới từ admin
+      if (files.length > 0 && files[0].id !== SUBJECTS_FILE_ID) {
+        console.log('[Subjects] Phát hiện bản mới — đang tải lại...');
+        SUBJECTS_FILE_ID = null;
         await loadSubjectsFromGAS();
         toast('🔄 Danh sách môn thi vừa được cập nhật bởi quản trị viên!', 'info', 4000);
       }
     } catch(e) { /* bỏ qua lỗi polling */ }
-  }, 5 * 60 * 1000); // 5 phút/lần
+  }, 5 * 60 * 1000);
 }
+
 // ĐÁP ÁN FILE IMPORT
 // ═══════════════════════════════════════════════════════════════
 // ─── Tạo tên folder từ tên môn thi (giống Google Form) ──────────────────────
