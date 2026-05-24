@@ -3897,11 +3897,12 @@ async function sheetsClear(range) {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + tok },
   });
-  if (!resp.ok) {
+  // 400 khi range trống là bình thường — bỏ qua
+  if (!resp.ok && resp.status !== 400) {
     if (resp.status === 401) { _oauthToken = null; _oauthTokenExp = 0; }
     throw new Error('Sheets CLEAR ' + resp.status);
   }
-  return resp.json();
+  return resp.ok ? resp.json() : {};
 }
 
 // ─── Đảm bảo sheet DATA có header ─────────────────────────────────────────────
