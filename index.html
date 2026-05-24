@@ -4479,6 +4479,42 @@ function applySubjectsList(list, fileName) {
 }
 
 // ── Lưu danh sách môn thi vào Sheet SUBJECTS + localStorage ─────────────────
+// ── Tạo sheet SUBJECTS nếu chưa tồn tại ─────────────────────────────────────
+async function ensureSubjectsSheet() {
+  const tok = await getOAuthToken();
+
+  // Kiểm tra sheet đã tồn tại chưa
+  const metaResp = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties.title`,
+    { headers: { Authorization: 'Bearer ' + tok } }
+  );
+  if (!metaResp.ok) throw new Error('Không đọc được metadata spreadsheet');
+  const meta   = await metaResp.json();
+  const sheets = (meta.sheets || []).map(s => s.properties.title);
+
+  if (sheets.includes(SHEET_NAME_SUB)) {
+    console.log('[Subjects] Sheet SUBJECTS đã tồn tại');
+    return; // Đã có → không làm gì
+  }
+
+  // Tạo sheet mới bằng batchUpdate
+  const addResp = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [{ addSheet: { properties: { title: SHEET_NAME_SUB } } }]
+      }),
+    }
+  );
+  if (!addResp.ok) {
+    const e = await addResp.json().catch(() => ({}));
+    throw new Error('Tạo sheet SUBJECTS lỗi: ' + (e.error?.message || addResp.status));
+  }
+  console.log('[Subjects] ✅ Đã tạo sheet SUBJECTS');
+}
+
 async function saveSubjectsToDrive(jsonStr) {
   const data     = JSON.parse(jsonStr);
   const subjects = data.subjects || [];
@@ -4487,12 +4523,16 @@ async function saveSubjectsToDrive(jsonStr) {
   const ts       = new Date().toLocaleString('vi-VN');
   const meta     = `${fileName} | ${by} | ${ts}`;
 
-  // Ghi vào Sheet SUBJECTS: xóa cũ → ghi metadata dòng 1 → ghi môn từ dòng 2
+  // Bước 1: Đảm bảo sheet SUBJECTS tồn tại
+  await ensureSubjectsSheet();
+
+  // Bước 2: Xóa nội dung cũ
   await sheetsClear(SHEET_NAME_SUB + '!A:A');
-  // Dùng batchUpdate để ghi tất cả 1 lần — tránh nhiều request
-  const tok = await getOAuthToken();
+
+  // Bước 3: Ghi toàn bộ 1 lần (metadata dòng 1 + danh sách từ dòng 2)
+  const tok     = await getOAuthToken();
   const allRows = [[meta], ...subjects.map(s => [s])];
-  const resp = await fetch(
+  const resp    = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_NAME_SUB + '!A1:A' + allRows.length)}?valueInputOption=RAW`,
     {
       method: 'PUT',
@@ -4505,14 +4545,14 @@ async function saveSubjectsToDrive(jsonStr) {
     throw new Error('Sheets ghi lỗi ' + resp.status + ': ' + (e.error?.message || ''));
   }
 
-  // Lưu vào localStorage để cache — các tab khác trên cùng máy đọc được ngay
+  // Bước 4: Cache vào localStorage để tab khác trên cùng máy đọc ngay
   try {
     localStorage.setItem('subjects_cache', JSON.stringify({
       subjects, fileName, updatedBy: by, updatedAt: Date.now()
     }));
   } catch(_) {}
 
-  console.log('[Subjects] ✅ Đã lưu vào Sheet + localStorage');
+  console.log(`[Subjects] ✅ Đã lưu ${subjects.length} môn vào Sheet SUBJECTS + localStorage`);
   return 'sheet_ok';
 }
 
@@ -4790,14 +4830,13 @@ async function gasPost(payload) {
     const ts       = new Date().toLocaleString('vi-VN');
     if (subjects.length === 0) return { status: 'error', message: 'Danh sách trống' };
 
-    // Bước 1: Xóa toàn bộ sheet SUBJECTS
-    await sheetsClear(SHEET_NAME_SUB + '!A:A');
+    // Đảm bảo sheet SUBJECTS tồn tại trước khi ghi
+    await ensureSubjectsSheet();
 
-    // Bước 2: Ghi metadata vào dòng 1 bằng UPDATE (không dùng append)
+    // Xóa → ghi metadata dòng 1 → ghi danh sách từ dòng 2
+    await sheetsClear(SHEET_NAME_SUB + '!A:A');
     const meta = `${fileName} | ${by} | ${ts}`;
     await sheetsUpdate(SHEET_NAME_SUB + '!A1', [[meta]]);
-
-    // Bước 3: Ghi danh sách môn từ dòng 2 trở đi bằng UPDATE
     const subjectRows = subjects.map(s => [s]);
     await sheetsUpdate(SHEET_NAME_SUB + `!A2:A${subjects.length + 1}`, subjectRows);
 
