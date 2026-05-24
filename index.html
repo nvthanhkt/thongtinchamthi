@@ -4439,21 +4439,23 @@ async function importSubjectsFile(input) {
 
       // ── Áp dụng ngay cho tab hiện tại ──────────────────────────────────────
       applySubjectsList(list, file.name);
-      toast(`✓ Đã tải ${list.length} môn — đang lưu lên Drive...`, 'info', 4000);
+      toast(`✓ Đã đọc ${list.length} môn — đang lưu lên Google Sheet...`, 'info', 4000);
 
-      // ── Lưu JSON lên Drive để tất cả người dùng fetch về ────────────────────
+      // ── Lưu vào Sheet SUBJECTS để tất cả người dùng nhận được ───────────────
       try {
-        const jsonStr  = JSON.stringify({ fileName: file.name, subjects: list,
-                           updatedBy: currentUser?.email || '', updatedAt: new Date().toISOString() });
-        const fileId   = await saveSubjectsToDrive(jsonStr);
-        if (fileId) {
-          SUBJECTS_FILE_ID = fileId;
-          toast(`✅ Đã lưu ${list.length} môn thi lên Drive — tất cả người dùng sẽ nhận được!`, 'success', 5000);
+        const jsonStr = JSON.stringify({
+          fileName: file.name, subjects: list,
+          updatedBy: currentUser?.email || '', updatedAt: new Date().toISOString()
+        });
+        const result = await saveSubjectsToDrive(jsonStr);
+        if (result) {
+          toast(`✅ Đã lưu ${list.length} môn thi vào Google Sheet — tất cả người dùng sẽ nhận được!`, 'success', 6000);
         } else {
-          toast('⚠ Lưu Drive thất bại — danh sách chỉ có hiệu lực ở tab này.', 'error', 5000);
+          toast('⚠ Lưu Sheet thất bại — danh sách chỉ có hiệu lực ở tab này.', 'error', 5000);
         }
       } catch(err) {
-        toast('⚠ Lỗi lưu Drive: ' + err.message, 'error', 5000);
+        console.error('[Import] Lỗi:', err);
+        toast('⚠ Lỗi lưu Sheet: ' + err.message, 'error', 8000);
       }
 
     } catch (err) {
@@ -4523,16 +4525,52 @@ async function saveSubjectsToDrive(jsonStr) {
   const ts       = new Date().toLocaleString('vi-VN');
   const meta     = `${fileName} | ${by} | ${ts}`;
 
-  // Bước 1: Đảm bảo sheet SUBJECTS tồn tại
-  await ensureSubjectsSheet();
+  // Bước 1: Lấy token
+  toast('🔑 Bước 1/4: Đang lấy quyền truy cập...', 'info', 5000);
+  const tok = await getOAuthToken();
+  console.log('[Subjects] Token OK:', tok ? tok.substring(0,20)+'...' : 'NULL');
 
-  // Bước 2: Xóa nội dung cũ
+  // Bước 2: Kiểm tra/tạo sheet SUBJECTS
+  toast('📋 Bước 2/4: Kiểm tra sheet SUBJECTS...', 'info', 5000);
+  const metaResp = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties.title`,
+    { headers: { Authorization: 'Bearer ' + tok } }
+  );
+  if (!metaResp.ok) {
+    const e = await metaResp.json().catch(() => ({}));
+    throw new Error('Đọc Spreadsheet lỗi ' + metaResp.status + ': ' + (e.error?.message || ''));
+  }
+  const metaData = await metaResp.json();
+  const sheetNames = (metaData.sheets || []).map(s => s.properties.title);
+  console.log('[Subjects] Sheets hiện có:', sheetNames);
+
+  if (!sheetNames.includes(SHEET_NAME_SUB)) {
+    toast('➕ Đang tạo sheet SUBJECTS mới...', 'info', 5000);
+    const addResp = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requests: [{ addSheet: { properties: { title: SHEET_NAME_SUB } } }] }),
+      }
+    );
+    if (!addResp.ok) {
+      const e = await addResp.json().catch(() => ({}));
+      throw new Error('Tạo sheet lỗi ' + addResp.status + ': ' + (e.error?.message || ''));
+    }
+    console.log('[Subjects] ✅ Tạo sheet SUBJECTS thành công');
+  } else {
+    console.log('[Subjects] Sheet SUBJECTS đã tồn tại');
+  }
+
+  // Bước 3: Xóa nội dung cũ
+  toast('🗑 Bước 3/4: Xóa dữ liệu cũ...', 'info', 5000);
   await sheetsClear(SHEET_NAME_SUB + '!A:A');
 
-  // Bước 3: Ghi toàn bộ 1 lần (metadata dòng 1 + danh sách từ dòng 2)
-  const tok     = await getOAuthToken();
+  // Bước 4: Ghi toàn bộ 1 lần
+  toast('💾 Bước 4/4: Đang ghi ' + subjects.length + ' môn thi...', 'info', 8000);
   const allRows = [[meta], ...subjects.map(s => [s])];
-  const resp    = await fetch(
+  const writeResp = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_NAME_SUB + '!A1:A' + allRows.length)}?valueInputOption=RAW`,
     {
       method: 'PUT',
@@ -4540,19 +4578,21 @@ async function saveSubjectsToDrive(jsonStr) {
       body: JSON.stringify({ values: allRows }),
     }
   );
-  if (!resp.ok) {
-    const e = await resp.json().catch(() => ({}));
-    throw new Error('Sheets ghi lỗi ' + resp.status + ': ' + (e.error?.message || ''));
+  if (!writeResp.ok) {
+    const e = await writeResp.json().catch(() => ({}));
+    throw new Error('Ghi Sheet lỗi ' + writeResp.status + ': ' + (e.error?.message || ''));
   }
+  const writeResult = await writeResp.json();
+  console.log('[Subjects] Ghi xong:', writeResult.updatedCells, 'ô');
 
-  // Bước 4: Cache vào localStorage để tab khác trên cùng máy đọc ngay
+  // Cache localStorage
   try {
     localStorage.setItem('subjects_cache', JSON.stringify({
       subjects, fileName, updatedBy: by, updatedAt: Date.now()
     }));
   } catch(_) {}
 
-  console.log(`[Subjects] ✅ Đã lưu ${subjects.length} môn vào Sheet SUBJECTS + localStorage`);
+  console.log(`[Subjects] ✅ Hoàn tất: ${subjects.length} môn vào Sheet SUBJECTS`);
   return 'sheet_ok';
 }
 
