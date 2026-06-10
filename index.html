@@ -1321,6 +1321,7 @@ function onLoginSuccess() {
   // Load dữ liệu local ngay, Sheets API sẽ load sau khi có quyền
   updateCount();
   renderTable(loadLocal());
+  loadSubjectsFromGAS();   // CSV public — không cần token
   startSubjectsPolling();
 }
 
@@ -1924,7 +1925,8 @@ async function saveSubjectsToDrive(jsonStr) {
   return 'sheet_ok';
 }
 
-// ── Tải danh sách môn thi: localStorage (nhanh) → Sheet SUBJECTS (chính xác) ─
+// ── Tải danh sách môn thi: CSV public (không cần token) → localStorage cache ──
+// Sheet SUBJECTS phải được chia sẻ "Anyone with link can view"
 async function loadSubjectsFromGAS(attempt) {
   attempt = attempt || 0;
 
@@ -1934,61 +1936,77 @@ async function loadSubjectsFromGAS(attempt) {
       const cached = JSON.parse(localStorage.getItem('subjects_cache') || 'null');
       if (cached && Array.isArray(cached.subjects) && cached.subjects.length > 0) {
         applySubjectsList(cached.subjects, cached.fileName || 'cache');
-        console.log(`[Subjects] Cache: ${cached.subjects.length} môn (${new Date(cached.updatedAt).toLocaleString('vi-VN')})`);
+        console.log(`[Subjects] Cache: ${cached.subjects.length} môn`);
       }
     } catch(_) {}
   }
 
-  // Bước 2: Đọc từ Sheet SUBJECTS để có dữ liệu mới nhất
+  // Bước 2: Fetch CSV public — không cần token, không cần cấp quyền
+  // URL format: https://docs.google.com/spreadsheets/d/{ID}/gviz/tq?tqx=out:csv&sheet={SHEET}
   try {
-    const raw  = await sheetsGet(SHEET_NAME_SUB + '!A:A');
-    const rows = raw.values || [];
-    if (rows.length < 2) {
-      console.log('[Subjects] Sheet SUBJECTS trống — dùng danh sách mặc định');
+    const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(SHEET_NAME_SUB)}&t=${Date.now()}`;
+    const resp   = await fetch(csvUrl);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+    const text = await resp.text();
+    if (!text || text.trim().length < 10) {
+      console.log('[Subjects] CSV trống');
       return;
     }
-    const meta     = String(rows[0][0] || '');
-    const fileName = meta.split('|')[0].trim() || 'server';
-    const subjects = rows.slice(1).map(r => String(r[0]||'')).filter(Boolean);
+
+    // Parse CSV — mỗi dòng là 1 môn thi (bỏ dòng 1 metadata)
+    const lines = text.split('\n')
+      .map(l => l.trim().replace(/^"|"$/g, '').replace(/""/g, '"'))
+      .filter(Boolean);
+
+    if (lines.length < 2) {
+      console.log('[Subjects] Chưa có dữ liệu môn thi');
+      return;
+    }
+
+    const fileName = lines[0].split('|')[0].trim() || 'server';
+    const subjects = lines.slice(1).filter(l => l.length > 3);
+
     if (subjects.length > 0) {
       applySubjectsList(subjects, fileName);
-      // Cập nhật cache localStorage
       try {
         localStorage.setItem('subjects_cache', JSON.stringify({
           subjects, fileName, updatedAt: Date.now()
         }));
       } catch(_) {}
-      console.log(`[Subjects] ✅ Sheet: ${subjects.length} môn`);
+      console.log(`[Subjects] ✅ CSV: ${subjects.length} môn`);
     }
   } catch(e) {
     console.warn(`[Subjects] Lần ${attempt + 1} thất bại:`, e.message);
     if (attempt < 5) {
       setTimeout(() => loadSubjectsFromGAS(attempt + 1), (attempt + 1) * 2000);
     } else {
-      console.log('[Subjects] Hết lần thử — giữ nguyên danh sách hiện tại');
+      console.log('[Subjects] Hết lần thử — giữ cache hiện tại');
     }
   }
 }
 
 // ── Polling 5 phút: kiểm tra Sheet SUBJECTS có cập nhật mới không ───────────
 let _subjectsPollingTimer = null;
-let _lastSubjectsMeta     = '';   // metadata dòng 1 lần check trước
+let _lastSubjectsMeta     = '';
 
 function startSubjectsPolling() {
   if (_subjectsPollingTimer) clearInterval(_subjectsPollingTimer);
   _subjectsPollingTimer = setInterval(async () => {
-    if (!currentUser || !_oauthToken) return;
+    if (!currentUser) return;
     try {
-      // Chỉ đọc dòng 1 (metadata) để kiểm tra — nhẹ, nhanh
-      const raw  = await sheetsGet(SHEET_NAME_SUB + '!A1');
-      const meta = raw.values?.[0]?.[0] || '';
+      // Chỉ đọc dòng 1 (metadata) qua CSV — không cần token
+      const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(SHEET_NAME_SUB)}&range=A1&t=${Date.now()}`;
+      const resp   = await fetch(csvUrl);
+      if (!resp.ok) return;
+      const meta = (await resp.text()).trim().replace(/^"|"$/g, '');
       if (meta && meta !== _lastSubjectsMeta) {
         console.log('[Subjects] Phát hiện cập nhật mới — đang tải lại...');
         _lastSubjectsMeta = meta;
         await loadSubjectsFromGAS();
         toast('🔄 Danh sách môn thi vừa được cập nhật bởi quản trị viên!', 'info', 4000);
       } else if (!_lastSubjectsMeta && meta) {
-        _lastSubjectsMeta = meta; // khởi tạo lần đầu
+        _lastSubjectsMeta = meta;
       }
     } catch(e) { /* bỏ qua */ }
   }, 5 * 60 * 1000);
